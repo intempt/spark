@@ -18,7 +18,8 @@
 package org.apache.spark.scheduler.cluster.mesos
 
 import java.io.File
-import java.util.{Collections, List => JList}
+import java.lang.System.currentTimeMillis
+import java.util.{Collections, Date => JDate, List => JList}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 import java.util.concurrent.locks.ReentrantLock
 
@@ -63,7 +64,10 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
     new MesosHadoopDelegationTokenManager(conf, sc.hadoopConfiguration, driverEndpoint)
 
   // Blacklist a slave after this many failures
-  private val MAX_SLAVE_FAILURES = 2
+  private val MAX_SLAVE_FAILURES = conf.getInt("spark.executor.slave.maxFailures", 5)
+
+  private val blacklistPeriod = conf.getTimeAsMs("spark.executor.slave.blacklistPeriod", "5m")
+    .ensuring(_ >= 0, "spark.executor.slave.blacklistPeriod must be >= 0")
 
   private val maxCoresOption = conf.getOption("spark.cores.max").map(_.toInt)
 
@@ -572,8 +576,10 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
       cpus <= offerCPUs &&
       cpus + totalCoresAcquired <= maxCores &&
       mem <= offerMem &&
-      numExecutors < executorLimit &&
-      slaves.get(slaveId).map(_.taskFailures).getOrElse(0) < MAX_SLAVE_FAILURES &&
+      numExecutors() < executorLimit &&
+      (currentTimeMillis() -
+        slaves.get(slaveId).map(_.blacklistedAt)
+          .getOrElse(0L)) > blacklistPeriod &&
       meetsPortRequirements &&
       satisfiesLocality(offerHostname)
   }
@@ -655,8 +661,15 @@ private[spark] class MesosCoarseGrainedSchedulerBackend(
           slave.taskFailures += 1
 
           if (slave.taskFailures >= MAX_SLAVE_FAILURES) {
-            logInfo(s"Blacklisting Mesos slave $slaveId due to too many failures; " +
-                "is Spark installed on it?")
+            slave.blacklistedAt = currentTimeMillis()
+            slave.taskFailures = 0
+
+            val blacklistReadableDate = new JDate(slave.blacklistedAt)
+
+            logInfo(s"Blacklisting Mesos slave $slaveId due to " +
+              s"too many failures ($MAX_SLAVE_FAILURES) " +
+              s"at $blacklistReadableDate; " +
+              "is Spark installed on it?")
           }
         }
         executorTerminated(d, slaveId, taskId, s"Executor finished with state $state")
@@ -802,6 +815,7 @@ private class Slave(val hostname: String) {
   val taskIDs = new mutable.HashSet[String]()
   var taskFailures = 0
   var shuffleRegistered = false
+  var blacklistedAt = 0L
 }
 
 object IdHelper {
