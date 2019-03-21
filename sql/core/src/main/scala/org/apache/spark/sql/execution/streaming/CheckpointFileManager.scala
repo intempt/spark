@@ -145,11 +145,17 @@ object CheckpointFileManager extends Logging {
         underlyingStream.close()
         try {
           fm.renameTempFile(tempPath, finalPath, overwriteIfPossible)
+          
+          // SPARK-17475: HDFSMetadataLog should not leak CRC files
+          // If the underlying filesystem didn't rename the CRC file, delete it.
+          val crcPath = new Path(tempPath.getParent(), s".${tempPath.getName()}.crc")
+          if (fm.exists(crcPath)) fm.delete(crcPath)
         } catch {
           case fe: FileAlreadyExistsException =>
             logWarning(
               s"Failed to rename temp file $tempPath to $finalPath because file exists", fe)
             if (!overwriteIfPossible) throw fe
+          case e => throw e
         }
         logInfo(s"Renamed temp file $tempPath to $finalPath")
       } finally {
